@@ -3,6 +3,7 @@
 [![NPM version](https://badge.fury.io/js/localforage.svg)](http://badge.fury.io/js/localforage)
 [![Dependency Status](https://img.shields.io/david/localForage/localForage.svg)](https://david-dm.org/localForage/localForage)
 [![npm](https://img.shields.io/npm/dm/localforage.svg?maxAge=2592000)]()
+[![jsDelivr Hits](https://data.jsdelivr.com/v1/package/npm/localforage/badge?style=rounded)](https://www.jsdelivr.com/package/npm/localforage)
 
 localForage is a fast and simple storage library for JavaScript. localForage
 improves the offline experience of your web app by using asynchronous storage
@@ -201,8 +202,10 @@ models in your framework so you can store data offline with localForage. We
 have drivers for the following frameworks:
 
 * [AngularJS](https://github.com/ocombe/angular-localForage)
+* [Angular 4+](https://www.npmjs.com/package/ngforage)
 * [Backbone](https://github.com/localForage/localForage-backbone)
 * [Ember](https://github.com/genkgo/ember-localforage-adapter)
+* [Vue](https://github.com/dmlzj/vlf)
 
 If you have a driver you'd like listed, please
 [open an issue](https://github.com/localForage/localForage/issues/new) to have it

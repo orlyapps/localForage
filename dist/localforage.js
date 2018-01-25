@@ -1,6 +1,6 @@
 /*!
     localForage -- Offline Storage, Improved
-    Version 1.5.0
+    Version 1.5.4
     https://localforage.github.io/localForage
     (c) 2013-2017 Mozilla, Apache License 2.0
 */
@@ -90,7 +90,7 @@ var REJECTED = ['REJECTED'];
 var FULFILLED = ['FULFILLED'];
 var PENDING = ['PENDING'];
 
-module.exports = exports = Promise;
+module.exports = Promise;
 
 function Promise(resolver) {
   if (typeof resolver !== 'function') {
@@ -196,7 +196,7 @@ handlers.reject = function (self, error) {
 function getThen(obj) {
   // Make sure we only access the accessor once as required by the spec
   var then = obj && obj.then;
-  if (obj && typeof obj === 'object' && typeof then === 'function') {
+  if (obj && (typeof obj === 'object' || typeof obj === 'function') && typeof then === 'function') {
     return function appyThen() {
       then.apply(obj, arguments);
     };
@@ -244,7 +244,7 @@ function tryCatch(func, value) {
   return out;
 }
 
-exports.resolve = resolve;
+Promise.resolve = resolve;
 function resolve(value) {
   if (value instanceof this) {
     return value;
@@ -252,13 +252,13 @@ function resolve(value) {
   return handlers.resolve(new this(INTERNAL), value);
 }
 
-exports.reject = reject;
+Promise.reject = reject;
 function reject(reason) {
   var promise = new this(INTERNAL);
   return handlers.reject(promise, reason);
 }
 
-exports.all = all;
+Promise.all = all;
 function all(iterable) {
   var self = this;
   if (Object.prototype.toString.call(iterable) !== '[object Array]') {
@@ -297,7 +297,7 @@ function all(iterable) {
   }
 }
 
-exports.race = race;
+Promise.race = race;
 function race(iterable) {
   var self = this;
   if (Object.prototype.toString.call(iterable) !== '[object Array]') {
@@ -365,7 +365,9 @@ function getIDB() {
         if (typeof msIndexedDB !== 'undefined') {
             return msIndexedDB;
         }
-    } catch (e) {}
+    } catch (e) {
+        return;
+    }
 }
 
 var idb = getIDB();
@@ -390,19 +392,9 @@ function isIndexedDBValid() {
         return (!isSafari || hasFetch) && typeof indexedDB !== 'undefined' &&
         // some outdated implementations of IDB that appear on Samsung
         // and HTC Android devices <4.4 are missing IDBKeyRange
+        // See: https://github.com/mozilla/localForage/issues/128
+        // See: https://github.com/mozilla/localForage/issues/272
         typeof IDBKeyRange !== 'undefined';
-    } catch (e) {
-        return false;
-    }
-}
-
-function isWebSQLValid() {
-    return typeof openDatabase === 'function';
-}
-
-function isLocalStorageValid() {
-    try {
-        return typeof localStorage !== 'undefined' && 'setItem' in localStorage && localStorage.setItem;
     } catch (e) {
         return false;
     }
@@ -470,6 +462,12 @@ function normalizeKey(key) {
     }
 
     return key;
+}
+
+function getCallback() {
+    if (arguments.length && typeof arguments[arguments.length - 1] === 'function') {
+        return arguments[arguments.length - 1];
+    }
 }
 
 // Some code originally from async_storage.js in
@@ -556,8 +554,9 @@ function _deferReadiness(dbInfo) {
     // Create a deferred object representing the current database operation.
     var deferredOperation = {};
 
-    deferredOperation.promise = new Promise$1(function (resolve) {
+    deferredOperation.promise = new Promise$1(function (resolve, reject) {
         deferredOperation.resolve = resolve;
+        deferredOperation.reject = reject;
     });
 
     // Enqueue the deferred operation.
@@ -583,6 +582,7 @@ function _advanceReadiness(dbInfo) {
     // chain of promises).
     if (deferredOperation) {
         deferredOperation.resolve();
+        return deferredOperation.promise;
     }
 }
 
@@ -596,12 +596,12 @@ function _rejectReadiness(dbInfo, err) {
     // chain of promises).
     if (deferredOperation) {
         deferredOperation.reject(err);
+        return deferredOperation.promise;
     }
 }
 
 function _getConnection(dbInfo, upgradeNeeded) {
     return new Promise$1(function (resolve, reject) {
-
         if (dbInfo.db) {
             if (upgradeNeeded) {
                 _deferReadiness(dbInfo);
@@ -671,7 +671,7 @@ function _isUpgradeNeeded(dbInfo, defaultVersion) {
         // If the version is not the default one
         // then warn for impossible downgrade.
         if (dbInfo.version !== defaultVersion) {
-            console.warn('The database "' + dbInfo.name + '"' + ' can\'t be downgraded from version ' + dbInfo.db.version + ' to version ' + dbInfo.version + '.');
+            console.warn('The database "' + dbInfo.name + '"' + " can't be downgraded from version " + dbInfo.db.version + ' to version ' + dbInfo.version + '.');
         }
         // Align the versions to prevent errors.
         dbInfo.version = dbInfo.db.version;
@@ -751,15 +751,22 @@ function _tryReconnect(dbInfo) {
     var forages = dbContext.forages;
 
     for (var i = 0; i < forages.length; i++) {
-        if (forages[i]._dbInfo.db) {
-            forages[i]._dbInfo.db.close();
-            forages[i]._dbInfo.db = null;
+        var forage = forages[i];
+        if (forage._dbInfo.db) {
+            forage._dbInfo.db.close();
+            forage._dbInfo.db = null;
         }
     }
 
-    return _getConnection(dbInfo, false).then(function (db) {
+    return _getOriginalConnection(dbInfo).then(function (db) {
         for (var j = 0; j < forages.length; j++) {
             forages[j]._dbInfo.db = db;
+        }
+        dbInfo.db = db;
+    }).then(function () {
+        if (_isUpgradeNeeded(dbInfo)) {
+            // Reopen the database for upgrading.
+            return _getUpgradedConnection(dbInfo);
         }
     })["catch"](function (err) {
         _rejectReadiness(dbInfo, err);
@@ -769,17 +776,30 @@ function _tryReconnect(dbInfo) {
 
 // FF doesn't like Promises (micro-tasks) and IDDB store operations,
 // so we have to do it with callbacks
-function createTransaction(dbInfo, mode, callback) {
+function createTransaction(dbInfo, mode, callback, retries) {
+    if (retries === undefined) {
+        retries = 1;
+    }
+
     try {
         var tx = dbInfo.db.transaction(dbInfo.storeName, mode);
         callback(null, tx);
     } catch (err) {
-        if (!dbInfo.db || err.name === 'InvalidStateError') {
-            return _tryReconnect(dbInfo).then(function () {
-
-                var tx = dbInfo.db.transaction(dbInfo.storeName, mode);
-                callback(null, tx);
-            });
+        if (retries > 0 && (!dbInfo.db || err.name === 'InvalidStateError' || err.name === 'NotFoundError')) {
+            return Promise$1.resolve().then(function () {
+                if (!dbInfo.db || err.name === 'NotFoundError' && !dbInfo.db.objectStoreNames.contains(dbInfo.storeName) && dbInfo.version <= dbInfo.db.version) {
+                    // increase the db version, to create the new ObjectStore
+                    if (dbInfo.db) {
+                        dbInfo.version = dbInfo.db.version + 1;
+                    }
+                    // Reopen the database for upgrading.
+                    return _getUpgradedConnection(dbInfo);
+                }
+            }).then(function () {
+                return _tryReconnect(dbInfo).then(function () {
+                    createTransaction(dbInfo, mode, callback, retries - 1);
+                });
+            })["catch"](callback);
         }
 
         callback(err);
@@ -1002,7 +1022,6 @@ function setItem(key, value, callback) {
 
                 try {
                     var store = transaction.objectStore(self._dbInfo.storeName);
-                    var req = store.put(value, key);
 
                     // The reason we don't _save_ null is because IE 10 does
                     // not support saving the `null` type in IndexedDB. How
@@ -1011,6 +1030,8 @@ function setItem(key, value, callback) {
                     if (value === null) {
                         value = undefined;
                     }
+
+                    var req = store.put(value, key);
 
                     transaction.oncomplete = function () {
                         // Cast to undefined so the value passed to
@@ -1252,9 +1273,115 @@ function keys(callback) {
     return promise;
 }
 
+function dropInstance(options, callback) {
+    callback = getCallback.apply(this, arguments);
+
+    var currentConfig = this.config();
+    options = typeof options !== 'function' && options || {};
+    if (!options.name) {
+        options.name = options.name || currentConfig.name;
+        options.storeName = options.storeName || currentConfig.storeName;
+    }
+
+    var self = this;
+    var promise;
+    if (!options.name) {
+        promise = Promise$1.reject('Invalid arguments');
+    } else {
+        var dbPromise = options.name === currentConfig.name && self._dbInfo.db ? Promise$1.resolve(self._dbInfo.db) : _getOriginalConnection(options);
+
+        if (!options.storeName) {
+            promise = dbPromise.then(function () {
+                _deferReadiness(options);
+
+                var dbContext = dbContexts[options.name];
+                var forages = dbContext.forages;
+
+                for (var i = 0; i < forages.length; i++) {
+                    var forage = forages[i];
+                    if (forage._dbInfo.db) {
+                        forage._dbInfo.db.close();
+                        forage._dbInfo.db = null;
+                    }
+                }
+
+                var dropDBPromise = new Promise$1(function (resolve, reject) {
+                    var req = idb.deleteDatabase(options.name);
+
+                    req.onerror = req.onblocked = reject;
+
+                    req.onsuccess = resolve;
+                });
+
+                return dropDBPromise.then(function () {
+                    for (var j = 0; j < forages.length; j++) {
+                        _advanceReadiness(forage._dbInfo);
+                    }
+                })["catch"](function (err) {
+                    (_rejectReadiness(options, err) || Promise$1.resolve())["catch"](function () {});
+                    throw err;
+                });
+            });
+        } else {
+            promise = dbPromise.then(function (db) {
+                if (!db.objectStoreNames.contains(options.storeName)) {
+                    return;
+                }
+
+                var newVersion = db.version + 1;
+
+                _deferReadiness(options);
+
+                var dbContext = dbContexts[options.name];
+                var forages = dbContext.forages;
+
+                for (var i = 0; i < forages.length; i++) {
+                    var forage = forages[i];
+                    if (forage._dbInfo.db) {
+                        forage._dbInfo.db.close();
+                        forage._dbInfo.db = null;
+                        forage._dbInfo.version = newVersion;
+                    }
+                }
+
+                var dropObjectPromise = new Promise$1(function (resolve, reject) {
+                    var req = idb.open(options.name, newVersion);
+
+                    req.onerror = reject;
+
+                    req.onupgradeneeded = function () {
+                        var db = req.result;
+                        db.deleteObjectStore(options.storeName);
+                    };
+
+                    req.onsuccess = function () {
+                        var db = req.result;
+                        resolve(db);
+                    };
+                });
+
+                return dropObjectPromise.then(function (db) {
+                    for (var j = 0; j < forages.length; j++) {
+                        var forage = forages[j];
+                        forage._dbInfo.db = db;
+                        _advanceReadiness(forage._dbInfo);
+                    }
+                })["catch"](function (err) {
+                    (_rejectReadiness(options, err) || Promise$1.resolve())["catch"](function () {});
+                    throw err;
+                });
+            });
+        }
+    }
+
+    executeCallback(promise, callback);
+    return promise;
+}
+
 var asyncStorage = {
     _driver: 'asyncStorage',
     _initStorage: _initStorage,
+    _support: isIndexedDBValid(),
     iterate: iterate,
     getItem: getItem,
     setItem: setItem,
@@ -1262,8 +1389,13 @@ var asyncStorage = {
     clear: clear,
     length: length,
     key: key,
-    keys: keys
+    keys: keys,
+    dropInstance: dropInstance
 };
+
+function isWebSQLValid() {
+    return typeof openDatabase === 'function';
+}
 
 // Sadly, the best way to save binary data in WebSQL/localStorage is serializing
 // it to Base64, so this is how we store it to prevent very strange errors with less
@@ -1499,6 +1631,11 @@ var localforageSerializer = {
  * Copyright (c) 2012 Niklas von Hertzen
  * Licensed under the MIT license.
  */
+
+function createDbTable(t, dbInfo, callback, errorCallback) {
+    t.executeSql('CREATE TABLE IF NOT EXISTS ' + dbInfo.storeName + ' ' + '(id INTEGER PRIMARY KEY, key unique, value)', [], callback, errorCallback);
+}
+
 // Open the WebSQL database (automatically creates one if one didn't
 // previously exist), using any options set in the config.
 function _initStorage$1(options) {
@@ -1524,17 +1661,37 @@ function _initStorage$1(options) {
 
         // Create our key/value table if it doesn't exist.
         dbInfo.db.transaction(function (t) {
-            t.executeSql('CREATE TABLE IF NOT EXISTS ' + dbInfo.storeName + ' (id INTEGER PRIMARY KEY, key unique, value)', [], function () {
+            createDbTable(t, dbInfo, function () {
                 self._dbInfo = dbInfo;
                 resolve();
             }, function (t, error) {
                 reject(error);
             });
-        });
+        }, reject);
     });
 
     dbInfo.serializer = localforageSerializer;
     return dbInfoPromise;
+}
+
+function tryExecuteSql(t, dbInfo, sqlStatement, args, callback, errorCallback) {
+    t.executeSql(sqlStatement, args, callback, function (t, error) {
+        if (error.code === error.SYNTAX_ERR) {
+            t.executeSql('SELECT name FROM sqlite_master ' + "WHERE type='table' AND name = ?", [name], function (t, results) {
+                if (!results.rows.length) {
+                    // if the table is missing (was deleted)
+                    // re-create it table and retry
+                    createDbTable(t, dbInfo, function () {
+                        t.executeSql(sqlStatement, args, callback, errorCallback);
+                    }, errorCallback);
+                } else {
+                    errorCallback(t, error);
+                }
+            }, errorCallback);
+        } else {
+            errorCallback(t, error);
+        }
+    }, errorCallback);
 }
 
 function getItem$1(key, callback) {
@@ -1546,7 +1703,7 @@ function getItem$1(key, callback) {
         self.ready().then(function () {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
-                t.executeSql('SELECT * FROM ' + dbInfo.storeName + ' WHERE key = ? LIMIT 1', [key], function (t, results) {
+                tryExecuteSql(t, dbInfo, 'SELECT * FROM ' + dbInfo.storeName + ' WHERE key = ? LIMIT 1', [key], function (t, results) {
                     var result = results.rows.length ? results.rows.item(0).value : null;
 
                     // Check to see if this is serialized content we need to
@@ -1557,7 +1714,6 @@ function getItem$1(key, callback) {
 
                     resolve(result);
                 }, function (t, error) {
-
                     reject(error);
                 });
             });
@@ -1576,7 +1732,7 @@ function iterate$1(iterator, callback) {
             var dbInfo = self._dbInfo;
 
             dbInfo.db.transaction(function (t) {
-                t.executeSql('SELECT * FROM ' + dbInfo.storeName, [], function (t, results) {
+                tryExecuteSql(t, dbInfo, 'SELECT * FROM ' + dbInfo.storeName, [], function (t, results) {
                     var rows = results.rows;
                     var length = rows.length;
 
@@ -1635,7 +1791,7 @@ function _setItem(key, value, callback, retriesLeft) {
                     reject(error);
                 } else {
                     dbInfo.db.transaction(function (t) {
-                        t.executeSql('INSERT OR REPLACE INTO ' + dbInfo.storeName + ' (key, value) VALUES (?, ?)', [key, value], function () {
+                        tryExecuteSql(t, dbInfo, 'INSERT OR REPLACE INTO ' + dbInfo.storeName + ' ' + '(key, value) VALUES (?, ?)', [key, value], function () {
                             resolve(originalValue);
                         }, function (t, error) {
                             reject(error);
@@ -1680,10 +1836,9 @@ function removeItem$1(key, callback) {
         self.ready().then(function () {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
-                t.executeSql('DELETE FROM ' + dbInfo.storeName + ' WHERE key = ?', [key], function () {
+                tryExecuteSql(t, dbInfo, 'DELETE FROM ' + dbInfo.storeName + ' WHERE key = ?', [key], function () {
                     resolve();
                 }, function (t, error) {
-
                     reject(error);
                 });
             });
@@ -1703,7 +1858,7 @@ function clear$1(callback) {
         self.ready().then(function () {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
-                t.executeSql('DELETE FROM ' + dbInfo.storeName, [], function () {
+                tryExecuteSql(t, dbInfo, 'DELETE FROM ' + dbInfo.storeName, [], function () {
                     resolve();
                 }, function (t, error) {
                     reject(error);
@@ -1726,12 +1881,10 @@ function length$1(callback) {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
                 // Ahhh, SQL makes this one soooooo easy.
-                t.executeSql('SELECT COUNT(key) as c FROM ' + dbInfo.storeName, [], function (t, results) {
+                tryExecuteSql(t, dbInfo, 'SELECT COUNT(key) as c FROM ' + dbInfo.storeName, [], function (t, results) {
                     var result = results.rows.item(0).c;
-
                     resolve(result);
                 }, function (t, error) {
-
                     reject(error);
                 });
             });
@@ -1756,7 +1909,7 @@ function key$1(n, callback) {
         self.ready().then(function () {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
-                t.executeSql('SELECT key FROM ' + dbInfo.storeName + ' WHERE id = ? LIMIT 1', [n + 1], function (t, results) {
+                tryExecuteSql(t, dbInfo, 'SELECT key FROM ' + dbInfo.storeName + ' WHERE id = ? LIMIT 1', [n + 1], function (t, results) {
                     var result = results.rows.length ? results.rows.item(0).key : null;
                     resolve(result);
                 }, function (t, error) {
@@ -1777,7 +1930,7 @@ function keys$1(callback) {
         self.ready().then(function () {
             var dbInfo = self._dbInfo;
             dbInfo.db.transaction(function (t) {
-                t.executeSql('SELECT key FROM ' + dbInfo.storeName, [], function (t, results) {
+                tryExecuteSql(t, dbInfo, 'SELECT key FROM ' + dbInfo.storeName, [], function (t, results) {
                     var keys = [];
 
                     for (var i = 0; i < results.rows.length; i++) {
@@ -1786,7 +1939,6 @@ function keys$1(callback) {
 
                     resolve(keys);
                 }, function (t, error) {
-
                     reject(error);
                 });
             });
@@ -1797,9 +1949,102 @@ function keys$1(callback) {
     return promise;
 }
 
+// https://www.w3.org/TR/webdatabase/#databases
+// > There is no way to enumerate or delete the databases available for an origin from this API.
+function getAllStoreNames(db) {
+    return new Promise$1(function (resolve, reject) {
+        db.transaction(function (t) {
+            t.executeSql('SELECT name FROM sqlite_master ' + "WHERE type='table' AND name <> '__WebKitDatabaseInfoTable__'", [], function (t, results) {
+                var storeNames = [];
+
+                for (var i = 0; i < results.rows.length; i++) {
+                    storeNames.push(results.rows.item(i).name);
+                }
+
+                resolve({
+                    db: db,
+                    storeNames: storeNames
+                });
+            }, function (t, error) {
+                reject(error);
+            });
+        }, function (sqlError) {
+            reject(sqlError);
+        });
+    });
+}
+
+function dropInstance$1(options, callback) {
+    callback = getCallback.apply(this, arguments);
+
+    var currentConfig = this.config();
+    options = typeof options !== 'function' && options || {};
+    if (!options.name) {
+        options.name = options.name || currentConfig.name;
+        options.storeName = options.storeName || currentConfig.storeName;
+    }
+
+    var self = this;
+    var promise;
+    if (!options.name) {
+        promise = Promise$1.reject('Invalid arguments');
+    } else {
+        promise = new Promise$1(function (resolve) {
+            var db;
+            if (options.name === currentConfig.name) {
+                // use the db reference of the current instance
+                db = self._dbInfo.db;
+            } else {
+                db = openDatabase(options.name, '', '', 0);
+            }
+
+            if (!options.storeName) {
+                // drop all database tables
+                resolve(getAllStoreNames(db));
+            } else {
+                resolve({
+                    db: db,
+                    storeNames: [options.storeName]
+                });
+            }
+        }).then(function (operationInfo) {
+            return new Promise$1(function (resolve, reject) {
+                operationInfo.db.transaction(function (t) {
+                    function dropTable(storeName) {
+                        return new Promise$1(function (resolve, reject) {
+                            t.executeSql('DROP TABLE IF EXISTS ' + storeName, [], function () {
+                                resolve();
+                            }, function (t, error) {
+                                reject(error);
+                            });
+                        });
+                    }
+
+                    var operations = [];
+                    for (var i = 0, len = operationInfo.storeNames.length; i < len; i++) {
+                        operations.push(dropTable(operationInfo.storeNames[i]));
+                    }
+
+                    Promise$1.all(operations).then(function () {
+                        resolve();
+                    })["catch"](function (e) {
+                        reject(e);
+                    });
+                }, function (sqlError) {
+                    reject(sqlError);
+                });
+            });
+        });
+    }
+
+    executeCallback(promise, callback);
+    return promise;
+}
+
 var webSQLStorage = {
     _driver: 'webSQLStorage',
     _initStorage: _initStorage$1,
+    _support: isWebSQLValid(),
     iterate: iterate$1,
     getItem: getItem$1,
     setItem: setItem$1,
@@ -1807,8 +2052,48 @@ var webSQLStorage = {
     clear: clear$1,
     length: length$1,
     key: key$1,
-    keys: keys$1
+    keys: keys$1,
+    dropInstance: dropInstance$1
 };
+
+function isLocalStorageValid() {
+    try {
+        return typeof localStorage !== 'undefined' && 'setItem' in localStorage && typeof localStorage.setItem === 'function';
+    } catch (e) {
+        return false;
+    }
+}
+
+function _getKeyPrefix(options, defaultConfig) {
+    var keyPrefix = options.name + '/';
+
+    if (options.storeName !== defaultConfig.storeName) {
+        keyPrefix += options.storeName + '/';
+    }
+    return keyPrefix;
+}
+
+// Check if localStorage throws when saving an item
+function checkIfLocalStorageThrows() {
+    var localStorageTestKey = '_localforage_support_test';
+
+    try {
+        localStorage.setItem(localStorageTestKey, true);
+        localStorage.removeItem(localStorageTestKey);
+
+        return false;
+    } catch (e) {
+        return true;
+    }
+}
+
+// Check if localStorage is usable and allows to save an item
+// This method checks if localStorage is usable in Safari Private Browsing
+// mode, or in any other case where the available quota for localStorage
+// is 0 and there wasn't any saved items yet.
+function _isLocalStorageUsable() {
+    return !checkIfLocalStorageThrows() || localStorage.length > 0;
+}
 
 // Config the localStorage backend, using options set in the config.
 function _initStorage$2(options) {
@@ -1820,10 +2105,10 @@ function _initStorage$2(options) {
         }
     }
 
-    dbInfo.keyPrefix = dbInfo.name + '/';
+    dbInfo.keyPrefix = _getKeyPrefix(options, self._defaultConfig);
 
-    if (dbInfo.storeName !== self._defaultConfig.storeName) {
-        dbInfo.keyPrefix += dbInfo.storeName + '/';
+    if (!_isLocalStorageUsable()) {
+        return Promise$1.reject();
     }
 
     self._dbInfo = dbInfo;
@@ -1956,8 +2241,9 @@ function keys$2(callback) {
         var keys = [];
 
         for (var i = 0; i < length; i++) {
-            if (localStorage.key(i).indexOf(dbInfo.keyPrefix) === 0) {
-                keys.push(localStorage.key(i).substring(dbInfo.keyPrefix.length));
+            var itemKey = localStorage.key(i);
+            if (itemKey.indexOf(dbInfo.keyPrefix) === 0) {
+                keys.push(itemKey.substring(dbInfo.keyPrefix.length));
             }
         }
 
@@ -2039,10 +2325,46 @@ function setItem$2(key, value, callback) {
     return promise;
 }
 
+function dropInstance$2(options, callback) {
+    callback = getCallback.apply(this, arguments);
+
+    options = typeof options !== 'function' && options || {};
+    if (!options.name) {
+        var currentConfig = this.config();
+        options.name = options.name || currentConfig.name;
+        options.storeName = options.storeName || currentConfig.storeName;
+    }
+
+    var self = this;
+    var promise;
+    if (!options.name) {
+        promise = Promise$1.reject('Invalid arguments');
+    } else {
+        promise = new Promise$1(function (resolve) {
+            if (!options.storeName) {
+                resolve(options.name + '/');
+            } else {
+                resolve(_getKeyPrefix(options, self._defaultConfig));
+            }
+        }).then(function (keyPrefix) {
+            for (var i = localStorage.length - 1; i >= 0; i--) {
+                var key = localStorage.key(i);
+
+                if (key.indexOf(keyPrefix) === 0) {
+                    localStorage.removeItem(key);
+                }
+            }
+        });
+    }
+
+    executeCallback(promise, callback);
+    return promise;
+}
+
 var localStorageWrapper = {
     _driver: 'localStorageWrapper',
     _initStorage: _initStorage$2,
-    // Default API, from Gaia/localStorage.
+    _support: isLocalStorageValid(),
     iterate: iterate$2,
     getItem: getItem$2,
     setItem: setItem$2,
@@ -2050,22 +2372,31 @@ var localStorageWrapper = {
     clear: clear$2,
     length: length$2,
     key: key$2,
-    keys: keys$2
+    keys: keys$2,
+    dropInstance: dropInstance$2
 };
 
-// Custom drivers are stored here when `defineDriver()` is called.
+var isArray = Array.isArray || function (arg) {
+    return Object.prototype.toString.call(arg) === '[object Array]';
+};
+
+// Drivers are stored here when `defineDriver()` is called.
 // They are shared across all instances of localForage.
-var CustomDrivers = {};
+var DefinedDrivers = {};
 
-var DriverType = {
-    INDEXEDDB: 'asyncStorage',
-    LOCALSTORAGE: 'localStorageWrapper',
-    WEBSQL: 'webSQLStorage'
+var DriverSupport = {};
+
+var DefaultDrivers = {
+    INDEXEDDB: asyncStorage,
+    WEBSQL: webSQLStorage,
+    LOCALSTORAGE: localStorageWrapper
 };
 
-var DefaultDriverOrder = [DriverType.INDEXEDDB, DriverType.WEBSQL, DriverType.LOCALSTORAGE];
+var DefaultDriverOrder = [DefaultDrivers.INDEXEDDB._driver, DefaultDrivers.WEBSQL._driver, DefaultDrivers.LOCALSTORAGE._driver];
 
-var LibraryMethods = ['clear', 'getItem', 'iterate', 'key', 'keys', 'length', 'removeItem', 'setItem'];
+var OptionalDriverMethods = ['dropInstance'];
+
+var LibraryMethods = ['clear', 'getItem', 'iterate', 'key', 'keys', 'length', 'removeItem', 'setItem'].concat(OptionalDriverMethods);
 
 var DefaultConfig = {
     description: '',
@@ -2076,22 +2407,6 @@ var DefaultConfig = {
     size: 4980736,
     storeName: 'keyvaluepairs',
     version: 1.0
-};
-
-var driverSupport = {};
-// Check to see if IndexedDB is available and if it is the latest
-// implementation; it's our preferred backend library. We use "_spec_test"
-// as the name of the database because it's not the one we'll operate on,
-// but it's useful to make sure its using the right spec.
-// See: https://github.com/mozilla/localForage/issues/128
-driverSupport[DriverType.INDEXEDDB] = isIndexedDBValid();
-
-driverSupport[DriverType.WEBSQL] = isWebSQLValid();
-
-driverSupport[DriverType.LOCALSTORAGE] = isLocalStorageValid();
-
-var isArray = Array.isArray || function (arg) {
-    return Object.prototype.toString.call(arg) === '[object Array]';
 };
 
 function callWhenReady(localForageInstance, libraryMethod) {
@@ -2108,12 +2423,12 @@ function extend() {
         var arg = arguments[i];
 
         if (arg) {
-            for (var key in arg) {
-                if (arg.hasOwnProperty(key)) {
-                    if (isArray(arg[key])) {
-                        arguments[0][key] = arg[key].slice();
+            for (var _key in arg) {
+                if (arg.hasOwnProperty(_key)) {
+                    if (isArray(arg[_key])) {
+                        arguments[0][_key] = arg[_key].slice();
                     } else {
-                        arguments[0][key] = arg[key];
+                        arguments[0][_key] = arg[_key];
                     }
                 }
             }
@@ -2123,23 +2438,24 @@ function extend() {
     return arguments[0];
 }
 
-function isLibraryDriver(driverName) {
-    for (var driver in DriverType) {
-        if (DriverType.hasOwnProperty(driver) && DriverType[driver] === driverName) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 var LocalForage = function () {
     function LocalForage(options) {
         _classCallCheck(this, LocalForage);
 
-        this.INDEXEDDB = DriverType.INDEXEDDB;
-        this.LOCALSTORAGE = DriverType.LOCALSTORAGE;
-        this.WEBSQL = DriverType.WEBSQL;
+        for (var driverTypeKey in DefaultDrivers) {
+            if (DefaultDrivers.hasOwnProperty(driverTypeKey)) {
+                var driver = DefaultDrivers[driverTypeKey];
+                var driverName = driver._driver;
+                this[driverTypeKey] = driverName;
+
+                if (!DefinedDrivers[driverName]) {
+                    // we don't need to wait for the promise,
+                    // since the default drivers can be defined
+                    // in a blocking manner
+                    this.defineDriver(driver);
+                }
+            }
+        }
 
         this._defaultConfig = extend({}, DefaultConfig);
         this._config = extend({}, this._defaultConfig, options);
@@ -2204,7 +2520,6 @@ var LocalForage = function () {
             try {
                 var driverName = driverObject._driver;
                 var complianceError = new Error('Custom driver not compliant; see ' + 'https://mozilla.github.io/localForage/#definedriver');
-                var namingError = new Error('Custom driver name already in use: ' + driverObject._driver);
 
                 // A driver name should be defined and not overlap with the
                 // library-defined, default drivers.
@@ -2212,23 +2527,49 @@ var LocalForage = function () {
                     reject(complianceError);
                     return;
                 }
-                if (isLibraryDriver(driverObject._driver)) {
-                    reject(namingError);
-                    return;
-                }
 
-                var customDriverMethods = LibraryMethods.concat('_initStorage');
-                for (var i = 0; i < customDriverMethods.length; i++) {
-                    var customDriverMethod = customDriverMethods[i];
-                    if (!customDriverMethod || !driverObject[customDriverMethod] || typeof driverObject[customDriverMethod] !== 'function') {
+                var driverMethods = LibraryMethods.concat('_initStorage');
+                for (var i = 0, len = driverMethods.length; i < len; i++) {
+                    var driverMethodName = driverMethods[i];
+
+                    // when the property is there,
+                    // it should be a method even when optional
+                    var isRequired = OptionalDriverMethods.indexOf(driverMethodName) < 0;
+                    if ((isRequired || driverObject[driverMethodName]) && typeof driverObject[driverMethodName] !== 'function') {
                         reject(complianceError);
                         return;
                     }
                 }
 
+                var configureMissingMethods = function configureMissingMethods() {
+                    var methodNotImplementedFactory = function methodNotImplementedFactory(methodName) {
+                        return function () {
+                            var error = new Error('Method ' + methodName + ' is not implemented by the current driver');
+                            var promise = Promise$1.reject(error);
+                            executeCallback(promise, arguments[arguments.length - 1]);
+                            return promise;
+                        };
+                    };
+
+                    for (var _i = 0, _len = OptionalDriverMethods.length; _i < _len; _i++) {
+                        var optionalDriverMethod = OptionalDriverMethods[_i];
+                        if (!driverObject[optionalDriverMethod]) {
+                            driverObject[optionalDriverMethod] = methodNotImplementedFactory(optionalDriverMethod);
+                        }
+                    }
+                };
+
+                configureMissingMethods();
+
                 var setDriverSupport = function setDriverSupport(support) {
-                    driverSupport[driverName] = support;
-                    CustomDrivers[driverName] = driverObject;
+                    if (DefinedDrivers[driverName]) {
+                        console.info('Redefining LocalForage driver: ' + driverName);
+                    }
+                    DefinedDrivers[driverName] = driverObject;
+                    DriverSupport[driverName] = support;
+                    // don't use a then, so that we can define
+                    // drivers that have simple _support methods
+                    // in a blocking manner
                     resolve();
                 };
 
@@ -2255,23 +2596,8 @@ var LocalForage = function () {
     };
 
     LocalForage.prototype.getDriver = function getDriver(driverName, callback, errorCallback) {
-        var self = this;
-        var getDriverPromise = Promise$1.resolve().then(function () {
-            if (isLibraryDriver(driverName)) {
-                switch (driverName) {
-                    case self.INDEXEDDB:
-                        return asyncStorage;
-                    case self.LOCALSTORAGE:
-                        return localStorageWrapper;
-                    case self.WEBSQL:
-                        return webSQLStorage;
-                }
-            } else if (CustomDrivers[driverName]) {
-                return CustomDrivers[driverName];
-            } else {
-                throw new Error('Driver not found.');
-            }
-        });
+        var getDriverPromise = DefinedDrivers[driverName] ? Promise$1.resolve(DefinedDrivers[driverName]) : Promise$1.reject(new Error('Driver not found.'));
+
         executeTwoCallbacks(getDriverPromise, callback, errorCallback);
         return getDriverPromise;
     };
@@ -2373,7 +2699,7 @@ var LocalForage = function () {
     };
 
     LocalForage.prototype.supports = function supports(driverName) {
-        return !!driverSupport[driverName];
+        return !!DriverSupport[driverName];
     };
 
     LocalForage.prototype._extend = function _extend(libraryMethodsAndProperties) {
@@ -2396,7 +2722,7 @@ var LocalForage = function () {
         // corresponding driver method until localForage is ready. These stubs
         // will be replaced by the driver methods as soon as the driver is
         // loaded, so there is no performance impact.
-        for (var i = 0; i < LibraryMethods.length; i++) {
+        for (var i = 0, len = LibraryMethods.length; i < len; i++) {
             callWhenReady(this, LibraryMethods[i]);
         }
     };

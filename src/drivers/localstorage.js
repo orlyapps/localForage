@@ -3,10 +3,43 @@
 // side-effects (all data will be serialized on save and only data that
 // can be converted to a string via `JSON.stringify()` will be saved).
 
+import isLocalStorageValid from '../utils/isLocalStorageValid';
 import serializer from '../utils/serializer';
 import Promise from '../utils/promise';
 import executeCallback from '../utils/executeCallback';
 import normalizeKey from '../utils/normalizeKey';
+import getCallback from '../utils/getCallback';
+
+function _getKeyPrefix(options, defaultConfig) {
+    var keyPrefix = options.name + '/';
+
+    if (options.storeName !== defaultConfig.storeName) {
+        keyPrefix += options.storeName + '/';
+    }
+    return keyPrefix;
+}
+
+// Check if localStorage throws when saving an item
+function checkIfLocalStorageThrows() {
+    var localStorageTestKey = '_localforage_support_test';
+
+    try {
+        localStorage.setItem(localStorageTestKey, true);
+        localStorage.removeItem(localStorageTestKey);
+
+        return false;
+    } catch (e) {
+        return true;
+    }
+}
+
+// Check if localStorage is usable and allows to save an item
+// This method checks if localStorage is usable in Safari Private Browsing
+// mode, or in any other case where the available quota for localStorage
+// is 0 and there wasn't any saved items yet.
+function _isLocalStorageUsable() {
+    return !checkIfLocalStorageThrows() || localStorage.length > 0;
+}
 
 // Config the localStorage backend, using options set in the config.
 function _initStorage(options) {
@@ -18,10 +51,10 @@ function _initStorage(options) {
         }
     }
 
-    dbInfo.keyPrefix = dbInfo.name + '/';
+    dbInfo.keyPrefix = _getKeyPrefix(options, self._defaultConfig);
 
-    if (dbInfo.storeName !== self._defaultConfig.storeName) {
-        dbInfo.keyPrefix += dbInfo.storeName + '/';
+    if (!_isLocalStorageUsable()) {
+        return Promise.reject();
     }
 
     self._dbInfo = dbInfo;
@@ -110,10 +143,13 @@ function iterate(iterator, callback) {
                 value = dbInfo.serializer.deserialize(value);
             }
 
-            value = iterator(value, key.substring(keyPrefixLength),
-                iterationNumber++);
+            value = iterator(
+                value,
+                key.substring(keyPrefixLength),
+                iterationNumber++
+            );
 
-            if (value !== void(0)) {
+            if (value !== void 0) {
                 return value;
             }
         }
@@ -155,8 +191,9 @@ function keys(callback) {
         var keys = [];
 
         for (var i = 0; i < length; i++) {
-            if (localStorage.key(i).indexOf(dbInfo.keyPrefix) === 0) {
-                keys.push(localStorage.key(i).substring(dbInfo.keyPrefix.length));
+            var itemKey = localStorage.key(i);
+            if (itemKey.indexOf(dbInfo.keyPrefix) === 0) {
+                keys.push(itemKey.substring(dbInfo.keyPrefix.length));
             }
         }
 
@@ -224,8 +261,10 @@ function setItem(key, value, callback) {
                     } catch (e) {
                         // localStorage capacity exceeded.
                         // TODO: Make this a specific error/event.
-                        if (e.name === 'QuotaExceededError' ||
-                            e.name === 'NS_ERROR_DOM_QUOTA_REACHED') {
+                        if (
+                            e.name === 'QuotaExceededError' ||
+                            e.name === 'NS_ERROR_DOM_QUOTA_REACHED'
+                        ) {
                             reject(e);
                         }
                         reject(e);
@@ -239,10 +278,46 @@ function setItem(key, value, callback) {
     return promise;
 }
 
+function dropInstance(options, callback) {
+    callback = getCallback.apply(this, arguments);
+
+    options = (typeof options !== 'function' && options) || {};
+    if (!options.name) {
+        var currentConfig = this.config();
+        options.name = options.name || currentConfig.name;
+        options.storeName = options.storeName || currentConfig.storeName;
+    }
+
+    var self = this;
+    var promise;
+    if (!options.name) {
+        promise = Promise.reject('Invalid arguments');
+    } else {
+        promise = new Promise(function(resolve) {
+            if (!options.storeName) {
+                resolve(`${options.name}/`);
+            } else {
+                resolve(_getKeyPrefix(options, self._defaultConfig));
+            }
+        }).then(function(keyPrefix) {
+            for (var i = localStorage.length - 1; i >= 0; i--) {
+                var key = localStorage.key(i);
+
+                if (key.indexOf(keyPrefix) === 0) {
+                    localStorage.removeItem(key);
+                }
+            }
+        });
+    }
+
+    executeCallback(promise, callback);
+    return promise;
+}
+
 var localStorageWrapper = {
     _driver: 'localStorageWrapper',
     _initStorage: _initStorage,
-    // Default API, from Gaia/localStorage.
+    _support: isLocalStorageValid(),
     iterate: iterate,
     getItem: getItem,
     setItem: setItem,
@@ -250,7 +325,8 @@ var localStorageWrapper = {
     clear: clear,
     length: length,
     key: key,
-    keys: keys
+    keys: keys,
+    dropInstance: dropInstance
 };
 
 export default localStorageWrapper;
